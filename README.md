@@ -17,10 +17,12 @@ This Python script efficiently scans files within user-specified folders using t
  - Create a folder to save the scan logs to, and change the script accordingly. 
 
 **Optional To Change**
-
 -What file types to scan (default is .exe, you can change and ad multiple)
+
 -Your Timing and Retries settings
+
 -Remove the 32MB file size limit (if you have a premium virustotal account, otherwise leave it).
+
 -Max concurrent scans (not reccomended unless you know what your doing)
 
 
