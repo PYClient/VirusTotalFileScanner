@@ -46,7 +46,7 @@ if not ScannerConfig.API_KEY:
     exit(1)
 
 # --- Global Initialization & Logging Setup ---
-timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+timestamp_str = datetime.now().strftime("%Y-%m-%d_%H:%M")
 ScannerConfig.BASE_SAVE_FOLDER = os.path.expanduser(ScannerConfig.BASE_SAVE_FOLDER)
 os.makedirs(ScannerConfig.BASE_SAVE_FOLDER, exist_ok=True)  # Ensure base folder exists
 
