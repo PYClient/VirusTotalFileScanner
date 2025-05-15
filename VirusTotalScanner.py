@@ -16,7 +16,7 @@ class ScannerConfig:
     # --- Core Settings ---
     FILE_EXTENSIONS = [".exe"] # File types to scan
     MAX_FILE_SIZE = 32 * 1024 * 1024  # 32MB (VirusTotal standard API limit for /files endpoint)
-    BASE_SAVE_FOLDER = "C:\\Your\\Log\\Folder\\Here" # Where to save logs
+    BASE_SAVE_FOLDER = "C:\\your\\log\\folder\\here" # Where to save logs
     MAX_SCAN_FOLDERS_INPUT = 6 # Limit number of folders user can input
 
     # --- API & Caching ---
@@ -46,11 +46,11 @@ if not ScannerConfig.API_KEY:
     exit(1)
 
 # --- Global Initialization & Logging Setup ---
-timestamp_str = datetime.now().strftime("%Y-%m-%d_%H:%M")
+timestamp_str = datetime.now().strftime("%m-%d-%Y_%H-%M")
 ScannerConfig.BASE_SAVE_FOLDER = os.path.expanduser(ScannerConfig.BASE_SAVE_FOLDER)
 os.makedirs(ScannerConfig.BASE_SAVE_FOLDER, exist_ok=True)  # Ensure base folder exists
 
-log_file_name = f"ScanReport_{timestamp_str}.log"
+log_file_name = f"ScanReport - {timestamp_str}.log"
 log_file = os.path.join(ScannerConfig.BASE_SAVE_FOLDER, log_file_name)
 
 logging.getLogger().setLevel(logging.DEBUG)
@@ -200,11 +200,11 @@ def increment_api_usage():
     """Increments API usage counters and saves them (Thread-safe)."""
     global api_counters
     with counter_lock:
-        api_counters = load_counters()
+        api_counters = load_counters() # Reload from file to ensure atomicity with other potential writers (if any) or process restarts
         api_counters["daily"]["count"] += 1
         api_counters["monthly"]["count"] += 1
         api_counters["all_time"] += 1
-    save_counters(api_counters)
+    save_counters(api_counters) # This already has counter_lock inside
 
 def print_usage_summary(prefix="", to_log=False):
     """Logs the current API usage statistics, using print_lock."""
@@ -231,11 +231,9 @@ def calculate_file_hash(file_path):
         return hex_digest
     except IOError as e:
         logging.error(f"Failed to read file for hashing: '{file_path}' - {e.__class__.__name__}: {e}")
-        # Don't print error here, let process_file handle it
         return None
     except Exception as e:
         logging.error(f"Unexpected error hashing file: '{file_path}' - {e.__class__.__name__}: {e}", exc_info=True)
-        # Don't print error here, let process_file handle it
         return None
 
 def check_file_hash(file_hash, file_basename):
@@ -256,14 +254,14 @@ def check_file_hash(file_hash, file_basename):
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
                 logging.debug(f"Hash {file_hash[:8]}... not found on VT API for '{file_basename}' (404).")
-                return None
+                return None # No API usage to increment here
             elif e.response.status_code == 429:
                 if not handle_rate_limit(retries, wait_time, context): return "error_ratelimit"
                 retries -= 1
                 wait_time = min(wait_time * 1.5, 120)
             else:
-                error_msg = f"   ERROR: {context} API Error: Status {e.response.status_code} - {e.response.reason}." # Simplified console msg
-                detail_msg = f"API Error {context}: Status {e.response.status_code} - {e.response.reason}. Response: {e.response.text[:200]}" # For log
+                error_msg = f"   ERROR: {context} API Error: Status {e.response.status_code} - {e.response.reason}."
+                detail_msg = f"API Error {context}: Status {e.response.status_code} - {e.response.reason}. Response: {e.response.text[:200]}"
                 with print_lock: print(Fore.RED + error_msg)
                 logging.error(detail_msg)
                 return "error_api"
@@ -283,8 +281,7 @@ def check_file_hash(file_hash, file_basename):
             retries -= 1
             if retries > 0: time.sleep(5)
             else: return "error_network"
-
-    return "error_ratelimit"
+    return "error_ratelimit" # Fallthrough if all retries exhausted
 
 def upload_file(file_path):
     """Uploads a file to VirusTotal for analysis. Returns Analysis ID or error string."""
@@ -296,13 +293,12 @@ def upload_file(file_path):
              logging.warning(f"{context} Skipping upload, file too large ({file_size / (1024*1024):.2f} MB)")
              return "skipped_size"
     except OSError as e:
-        # Let process_file report this error based on the return code
-        logging.error(f"{context} Cannot access file: {e.__class__.__name__}: {e}")
+        logging.error(f"{context} Cannot access file for size check: {e.__class__.__name__}: {e}")
         return "error_io"
 
-    upload_msg = f"   ⬆️ Uploading {file_basename} ({file_size / (1024*1024):.2f} MB)..." # Keep upload message
+    upload_msg = f"   ⬆️ Uploading {file_basename} ({file_size / (1024*1024):.2f} MB)..."
     with print_lock: print(Fore.BLUE + upload_msg)
-    logging.info(f"{context} Uploading ({file_size / (1024*1024):.2f} MB)...") # Log with context
+    logging.info(f"{context} Uploading ({file_size / (1024*1024):.2f} MB)...")
 
     retries = ScannerConfig.MAX_RATE_LIMIT_RETRIES
     wait_time = ScannerConfig.RATE_LIMIT_WAIT_SECONDS
@@ -310,14 +306,15 @@ def upload_file(file_path):
         try:
             with open(file_path, "rb") as file:
                 files_data = {"file": (file_basename, file)}
+                # Note: Upload itself does not count towards standard GET API quota for free tier,
+                # but the subsequent analysis GET does. For paid API, uploads might count.
+                # We'll increment API usage when polling for results, not here.
                 response = session.post(ScannerConfig.VT_UPLOAD_URL, files=files_data, timeout=180)
                 response.raise_for_status()
 
             analysis_id = response.json().get("data", {}).get("id")
             if analysis_id:
                 logging.info(f"{context} Upload Successful. Analysis ID: {analysis_id}")
-                # Don't print success here, let process_file show final result after polling
-                # with print_lock: print(Fore.BLUE + f"   {context} Upload successful. Analysis queued (ID: {analysis_id[:10]}...).")
                 return analysis_id
             else:
                 error_msg = f"   ERROR: {context} Upload OK but no Analysis ID received."
@@ -331,12 +328,26 @@ def upload_file(file_path):
                  if not handle_rate_limit(retries, wait_time, context): return "error_ratelimit"
                  retries -= 1
                  wait_time = min(wait_time * 1.5, 120)
-            elif e.response.status_code == 409:
-                 warn_msg = f"   INFO: {context} File already exists on VT (409 Conflict)." # Changed to INFO level for console
-                 detail_msg = f"{context} File already exists on VT (409 Conflict). Might indicate recent submission or hash collision."
+            elif e.response.status_code == 409: # Conflict - file already exists
+                 warn_msg = f"   INFO: {context} File already exists on VT (409 Conflict)."
+                 detail_msg = f"{context} File already exists on VT (409 Conflict). VT might reanalyze if old."
                  with print_lock: print(Fore.YELLOW + warn_msg)
                  logging.warning(detail_msg)
-                 return "skipped_conflict"
+                 # VT V3 /files POST: A 409 means the file exists. VT will re-analyse it.
+                 # The response to a 409 contains an analysis ID for the existing file which is now re-queued.
+                 # Example 409 response:
+                 # { "data": { "type": "analysis", "id": "ANALYSIS_ID_OF_EXISTING_FILE_NOW_REQUEUED" } }
+                 try:
+                     analysis_id = e.response.json().get("data", {}).get("id")
+                     if analysis_id:
+                         logging.info(f"{context} Received Analysis ID {analysis_id} from 409 Conflict response.")
+                         return analysis_id # This is the correct behavior for V3 API
+                     else: # Should not happen based on VT docs for 409 on /files POST
+                         logging.error(f"{context} 409 Conflict but no Analysis ID in response. Text: {e.response.text[:200]}")
+                         return "error_api_conflict_no_id"
+                 except json.JSONDecodeError:
+                     logging.error(f"{context} 409 Conflict but failed to parse JSON response. Text: {e.response.text[:200]}")
+                     return "error_api_conflict_bad_json"
             else:
                 error_msg = f"   ERROR: {context} API Error: Status {e.response.status_code} - {e.response.reason}."
                 detail_msg = f"API Error {context}: Status {e.response.status_code} - {e.response.reason}. Response: {e.response.text[:200]}"
@@ -360,34 +371,32 @@ def upload_file(file_path):
             if retries > 0: time.sleep(5)
             else: return "error_network"
         except IOError as e:
-             error_msg = f"   ERROR: {context} File I/O Error: {e.__class__.__name__}."
-             detail_msg = f"File I/O Error {context}: {e.__class__.__name__}: {e}"
+             error_msg = f"   ERROR: {context} File I/O Error during upload: {e.__class__.__name__}."
+             detail_msg = f"File I/O Error {context} during upload: {e.__class__.__name__}: {e}"
              with print_lock: print(Fore.RED + error_msg)
              logging.error(detail_msg, exc_info=True)
              return "error_io"
 
-    return "error_ratelimit"
+    return "error_ratelimit" # Fallthrough if all retries for upload exhausted
 
 def retrieve_scan_results(analysis_id, file_basename):
     """Polls VirusTotal for analysis results. Returns stats dict or error string."""
     url = ScannerConfig.VT_ANALYSIS_URL.format(analysis_id)
     context = f"[Poll Analysis {analysis_id[:10]} for '{file_basename}']"
-    # Remove polling start message from console
-    # poll_start_msg = f"Polling for results (ID: {analysis_id[:10]}...) for '{file_basename}'..."
-    # with print_lock: print(Fore.BLUE + f"   {poll_start_msg}")
     logging.info(f"{context} Starting polling.")
 
     for attempt in range(ScannerConfig.MAX_POLL_ATTEMPTS):
-        wait_duration = ScannerConfig.POLL_INTERVAL_SECONDS if attempt > 0 else 3
+        wait_duration = ScannerConfig.POLL_INTERVAL_SECONDS if attempt > 0 else 3 # Shorter first wait
         logging.debug(f"{context} Waiting {wait_duration}s before poll attempt {attempt + 1}/{ScannerConfig.MAX_POLL_ATTEMPTS}")
         time.sleep(wait_duration)
 
-        retries = 3
-        wait_time = ScannerConfig.RATE_LIMIT_WAIT_SECONDS
+        retries = 3 # Retries for transient issues per poll attempt
+        api_wait_time = ScannerConfig.RATE_LIMIT_WAIT_SECONDS # Separate from main poll wait
         while retries > 0:
             try:
                 response = session.get(url, timeout=30)
                 response.raise_for_status()
+                increment_api_usage() # Successful GET on /analyses counts
 
                 data = response.json().get("data", {})
                 attributes = data.get("attributes", {})
@@ -395,37 +404,43 @@ def retrieve_scan_results(analysis_id, file_basename):
                 logging.debug(f"{context} Poll Attempt {attempt+1}, Status: {status}")
 
                 if status == "completed":
-                    increment_api_usage()
                     stats = attributes.get("stats", {})
                     logging.info(f"{context} Analysis complete.")
                     return stats
                 elif status in ["queued", "inprogress"]:
-                    logging.debug(f"{context} Analysis status: {status}...")
-                    retries = 0
-                else:
-                    warn_msg = f"   WARN: {context} Unexpected analysis status: '{status}'." # Simplified console msg
+                    logging.debug(f"{context} Analysis status: {status}... continuing to poll.")
+                    retries = 0 # Break inner retry loop, continue outer poll loop
+                    break
+                else: # Unexpected status like 'failed', etc.
+                    warn_msg = f"   WARN: {context} Unexpected analysis status: '{status}'."
                     detail_msg = f"{context} Unexpected analysis status: '{status}'. Response: {response.text[:200]}"
                     with print_lock: print(Fore.YELLOW + warn_msg)
                     logging.warning(detail_msg)
-                    retries = 0
+                    # Treat as an error for this analysis if status is not known positive
+                    return f"error_analysis_status_{status}"
+
 
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 429:
-                    if not handle_rate_limit(retries, wait_time, context): return "error_ratelimit"
+                    # Pass the inner retry count for rate limit handling
+                    if not handle_rate_limit(retries, api_wait_time, context + f" attempt {attempt+1}"): return "error_ratelimit"
                     retries -= 1
-                    wait_time = min(wait_time * 1.5, 120)
+                    api_wait_time = min(api_wait_time * 1.5, 120)
+                    # No API usage increment on 429
                 elif e.response.status_code == 404:
                     error_msg = f"   ERROR: {context} Analysis ID not found (404)."
                     detail_msg = f"API Error {context}: Analysis ID not found (404). It might have expired or been invalid."
                     with print_lock: print(Fore.RED + error_msg)
                     logging.error(detail_msg)
-                    return "error_api_notfound"
+                    return "error_api_notfound" # No API usage
                 else:
                     error_msg = f"   ERROR: {context} API Error: Status {e.response.status_code} - {e.response.reason}."
                     detail_msg = f"API Error {context}: Status {e.response.status_code} - {e.response.reason}. Response: {e.response.text[:200]}"
                     with print_lock: print(Fore.RED + error_msg)
                     logging.error(detail_msg)
-                    retries = 0
+                    retries = 0 # Break inner retry loop, might be persistent error
+                    # No API usage
+                    break # Break from inner retry loop to outer poll loop if not retrying
 
             except requests.exceptions.Timeout as e:
                 error_msg = f"   ERROR: {context} Polling request timed out."
@@ -434,7 +449,8 @@ def retrieve_scan_results(analysis_id, file_basename):
                 logging.error(detail_msg)
                 retries -= 1
                 if retries > 0: time.sleep(5)
-                else: break
+                # No API usage
+                # Continue inner retry loop
 
             except requests.exceptions.RequestException as e:
                 error_msg = f"   ERROR: {context} Network Error: {e.__class__.__name__}."
@@ -443,10 +459,20 @@ def retrieve_scan_results(analysis_id, file_basename):
                 logging.error(detail_msg)
                 retries -= 1
                 if retries > 0: time.sleep(5)
-                else: break
+                # No API usage
+                # Continue inner retry loop
+            
+            # If an error occurred that broke the inner loop without setting retries = 0,
+            # this ensures we go to the next poll attempt or finish polling.
+            if retries == 0 and status not in ["queued", "inprogress", "completed"]:
+                # This means an unrecoverable error happened in this poll attempt's retries
+                logging.warning(f"{context} Poll attempt {attempt+1} failed after retries.")
+                # We might return an error specific to the last attempt or let polling timeout.
+                # For now, let the outer loop decide if it's a timeout.
 
+    # If loop finishes, it means MAX_POLL_ATTEMPTS reached without "completed"
     warn_msg = f"   WARN: {context} Polling timed out after {ScannerConfig.MAX_POLL_ATTEMPTS} attempts."
-    detail_msg = f"{context} Polling timed out after {ScannerConfig.MAX_POLL_ATTEMPTS} attempts."
+    detail_msg = f"{context} Polling timed out after {ScannerConfig.MAX_POLL_ATTEMPTS} attempts for analysis ID {analysis_id}."
     with print_lock: print(Fore.YELLOW + warn_msg)
     logging.warning(detail_msg)
     return "error_timeout_poll"
@@ -455,45 +481,41 @@ def process_file(file_path_tuple):
     """Processes a single file. Designed for thread pool. Returns status string."""
     file_path, file_index, total_files = file_path_tuple
     file_basename = os.path.basename(file_path)
-    thread_name = threading.current_thread().name
-
-    # No initial processing message per file
-    # with print_lock: print(f"\n[{file_index}/{total_files}] Processing: {Fore.CYAN}{file_basename}{Style.RESET_ALL} ({thread_name})")
-
-    # No initial newline needed if we only print the final result or errors
+    # thread_name = threading.current_thread().name # Not needed for final output formatting
 
     logging.info(f"--- [{file_index}/{total_files}] Starting '{file_basename}' ---")
     logging.info(f"File:         {file_path}")
 
-    final_output = "" # Store the final output string for this file
-    console_color = Style.RESET_ALL # Default color
+    final_output = ""
+    console_color = Style.RESET_ALL
+    result_status_code = "error_unknown" # Default status code if not set
 
-    try: # Wrap main logic in try-except to ensure final output is printed
+    try:
         # 1. Initial Checks
         try:
             if not os.path.exists(file_path):
-                raise OSError(f"File not found at processing time") # More specific error
+                raise OSError("File not found at processing time")
             file_size = os.path.getsize(file_path)
             logging.info(f"Size:         {file_size / (1024*1024):.2f} MB ('{file_basename}')")
             if file_size == 0:
                  logging.warning(f"Result:       SKIPPED (Empty File) '{file_basename}'")
                  final_output = f"Skipped (Empty): {file_basename}"
                  console_color = Fore.YELLOW
-                 logging.info(f"--- Finished '{file_basename}' ---")
-                 return "skipped_empty"
-            if file_size > ScannerConfig.MAX_FILE_SIZE:
-                 logging.warning(f"Result:       SKIPPED (Too Large: {file_size / (1024*1024):.2f}MB) '{file_basename}'")
-                 final_output = f"Skipped (Too Large): {file_basename}"
+                 result_status_code = "skipped_empty"
+                 return result_status_code
+            if file_size > ScannerConfig.MAX_FILE_SIZE: # Check before hashing if possible
+                 logging.warning(f"Result:       SKIPPED (Too Large: {file_size / (1024*1024):.2f}MB for API upload) '{file_basename}'")
+                 final_output = f"Skipped (Too Large for API): {file_basename}"
                  console_color = Fore.YELLOW
-                 logging.info(f"--- Finished '{file_basename}' ---")
-                 return "skipped_size"
+                 result_status_code = "skipped_size"
+                 return result_status_code # This skip is for upload, hash can still be checked
         except OSError as e:
              error_msg = f"Error accessing file '{file_basename}': {e.__class__.__name__}: {e}"
              logging.error(error_msg)
              final_output = f"ERROR accessing file: {file_basename} ({e.__class__.__name__})"
              console_color = Fore.RED
-             logging.info(f"--- Finished '{file_basename}' (Error) ---")
-             return "error_io"
+             result_status_code = "error_io"
+             return result_status_code
 
         # 2. Hashing
         logging.info(f"Hashing '{file_basename}'...")
@@ -502,52 +524,56 @@ def process_file(file_path_tuple):
             logging.error(f"Result:       ERROR (Hashing Failed) '{file_basename}'")
             final_output = f"ERROR Failed to hash: {file_basename}"
             console_color = Fore.RED
-            logging.info(f"--- Finished '{file_basename}' (Error) ---")
-            return "error_hash"
+            result_status_code = "error_hash"
+            return result_status_code
         logging.info(f"SHA256:       {file_hash} ('{file_basename}')")
 
         # 3. Cache Check
         logging.info(f"Cache Check for {file_hash[:8]}... ('{file_basename}')...")
-        cached_status = cached_hashes_global.get(file_hash)
-        result_status = None # Status code to return
+        # Access global cache within lock for reading, though less critical than writes
+        with cache_lock:
+            cached_status_from_global = cached_hashes_global.get(file_hash)
 
-        if cached_status:
-            logging.info(f"Cache Status: HIT ({cached_status}) for '{file_basename}'")
-            result_status_prefix = "UNKNOWN"
-            if cached_status == "clean":
+        if cached_status_from_global:
+            logging.info(f"Cache Status: HIT ({cached_status_from_global}) for '{file_basename}'")
+            result_status_prefix = "UNKNOWN (Cache)"
+            temp_result_code = "skipped_cache_unknown"
+
+            if cached_status_from_global == "clean":
                 result_status_prefix = "CLEAN"; console_color = Fore.GREEN
-                result_status = "skipped_cache_clean"
-            elif cached_status.startswith("malicious"):
-                 detection_info = cached_status.split(':', 1)[1] if ':' in cached_status else '?'
+                temp_result_code = "skipped_cache_clean"
+            elif cached_status_from_global.startswith("malicious"):
+                 detection_info = cached_status_from_global.split(':', 1)[1] if ':' in cached_status_from_global else '?'
                  result_status_prefix = f"MALICIOUS ({detection_info})"
                  console_color = Fore.RED
-                 result_status = "skipped_cache_malicious"
-            else:
-                 logging.warning(f"Cache contains unexpected status '{cached_status}' for {file_hash[:8]} ('{file_basename}'). Re-checking...")
-                 # No final output yet, proceed to API check
-                 result_status = None # Force re-check
+                 temp_result_code = "skipped_cache_malicious"
+            elif cached_status_from_global.startswith("suspicious"):
+                 detection_info = cached_status_from_global.split(':', 1)[1] if ':' in cached_status_from_global else '?'
+                 result_status_prefix = f"SUSPICIOUS ({detection_info})"
+                 console_color = Fore.YELLOW
+                 temp_result_code = "skipped_cache_suspicious"
+            else: # E.g. "inconclusive", "error:unknown_verdict"
+                 logging.warning(f"Cache contains non-definitive status '{cached_status_from_global}' for {file_hash[:8]} ('{file_basename}'). Re-checking API.")
+                 # Proceed to API check for non-definitive cached results
+                 cached_status_from_global = None # Force re-check by nullifying
 
-            if result_status: # Cache hit was definitive
+            if cached_status_from_global: # If it was a definitive cache hit
                 final_output = f"Result: {result_status_prefix} (from Cache) - {file_basename}"
-                # Color already set above
                 logging.info(f"Result:       {result_status_prefix} (from Cache) '{file_basename}'")
-                logging.info(f"--- Finished '{file_basename}' ---")
-                return result_status
+                result_status_code = temp_result_code
+                return result_status_code
         else:
             logging.info(f"Cache Status: MISS for {file_hash[:8]} ('{file_basename}')")
-            result_status = None # Ensure API check proceeds
 
         # --- API Interaction ---
         analysis_stats = None
-        analysis_source = "Unknown"
+        analysis_source = "Unknown API Source"
 
         # 4. VT Hash Report Check (API)
         logging.info(f"VT API Check (Hash Report) for {file_hash[:8]}... ('{file_basename}')...")
-        vt_result = check_file_hash(file_hash, file_basename)
+        vt_result = check_file_hash(file_hash, file_basename) # API usage incremented inside if successful
 
-        api_check_performed = True # Flag to indicate API was contacted
-
-        if isinstance(vt_result, dict):
+        if isinstance(vt_result, dict): # Hash found on VT
             logging.info(f"VT API Status: Found existing report for '{file_basename}'")
             attributes = vt_result.get("data", {}).get("attributes", {})
             analysis_stats = attributes.get("last_analysis_stats")
@@ -557,151 +583,170 @@ def process_file(file_path_tuple):
             except Exception: last_analysis_date = "Invalid Date"
             logging.info(f"Report Date:  {last_analysis_date} for '{file_basename}'")
             analysis_source = f"Existing Report ({last_analysis_date})"
-            # Don't print intermediate success here
 
-        elif vt_result is None:
+        elif vt_result is None: # Hash not found on VT, needs upload
             logging.info(f"VT API Status: Hash {file_hash[:8]} not found for '{file_basename}'. Requires upload.")
-            upload_response = upload_file(file_path) # Prints its own upload start message
+            # Check file size again specifically for upload endpoint limit, as we might have skipped this earlier
+            # if the primary MAX_FILE_SIZE was larger than upload limit (it's currently the same).
+            if file_size > ScannerConfig.MAX_FILE_SIZE: # Redundant if MAX_FILE_SIZE is already the API limit
+                 logging.warning(f"Result:       SKIPPED (Too Large for upload: {file_size / (1024*1024):.2f}MB) '{file_basename}'")
+                 final_output = f"Skipped (Too Large for upload): {file_basename}"
+                 console_color = Fore.YELLOW
+                 result_status_code = "skipped_size"
+                 return result_status_code
+
+            upload_response = upload_file(file_path) # This does not increment API counter itself
 
             if isinstance(upload_response, str) and upload_response.startswith("error"):
                 logging.error(f"Result:       ERROR (Upload Failed: {upload_response}) for '{file_basename}'")
-                # Error already printed by upload_file or handle_rate_limit
                 final_output = f"ERROR during upload for {file_basename} ({upload_response})"
                 console_color = Fore.RED
-                logging.info(f"--- Finished '{file_basename}' (Error) ---")
-                return upload_response
-
-            elif upload_response == "skipped_conflict":
-                 logging.warning(f"Upload returned 409 Conflict for '{file_basename}'. Counting as skipped.")
-                 final_output = f"Skipped (Conflict): {file_basename}"
-                 console_color = Fore.YELLOW
-                 logging.info(f"--- Finished '{file_basename}' (Skipped) ---")
-                 return upload_response
-
-            elif isinstance(upload_response, str) and upload_response.startswith("skipped"):
-                 # Should be caught earlier, but handle defensively
+                result_status_code = upload_response
+                return result_status_code
+            # elif upload_response == "skipped_conflict": # Handled by new 409 logic in upload_file
+            #      logging.warning(f"Upload returned 409 Conflict for '{file_basename}'. No new analysis needed, but existing might be polled.")
+            #      # If 409 is now returning an analysis_id, this path might not be hit.
+            #      # This specific string 'skipped_conflict' is no longer returned by upload_file.
+            #      # It would now return an analysis_id or an error.
+            #      final_output = f"Skipped (Conflict during upload): {file_basename}"
+            #      console_color = Fore.YELLOW
+            #      result_status_code = "skipped_conflict"
+            #      return result_status_code
+            elif isinstance(upload_response, str) and upload_response.startswith("skipped"): # e.g. "skipped_size"
                  logging.warning(f"Result:       SKIPPED (Upload returned: {upload_response}) for '{file_basename}'")
-                 final_output = f"Skipped ({upload_response}): {file_basename}"
+                 final_output = f"Skipped ({upload_response.split('_',1)[1]}): {file_basename}"
                  console_color = Fore.YELLOW
-                 logging.info(f"--- Finished '{file_basename}' (Skipped) ---")
-                 return upload_response
-
-            elif isinstance(upload_response, str): # Should be analysis ID
-                 logging.error(f"Result:       ERROR (Unexpected string from upload: {upload_response}) for '{file_basename}'")
-                 final_output = f"ERROR internal upload error for {file_basename}"
-                 console_color = Fore.RED
-                 logging.info(f"--- Finished '{file_basename}' (Error) ---")
-                 return "error_internal_upload"
-
-            else: # Got analysis ID
-                analysis_id = upload_response
-                poll_result = retrieve_scan_results(analysis_id, file_basename) # Prints own polling start message
+                 result_status_code = upload_response
+                 return result_status_code
+            elif isinstance(upload_response, str): # This is the analysis ID
+                analysis_id_from_upload = upload_response
+                logging.info(f"File '{file_basename}' uploaded/re-analyzed. Analysis ID: {analysis_id_from_upload[:10]}")
+                poll_result = retrieve_scan_results(analysis_id_from_upload, file_basename) # API usage incremented inside on success
 
                 if isinstance(poll_result, str) and poll_result.startswith("error"):
-                    logging.error(f"Result:       ERROR (Polling Failed: {poll_result}) for '{file_basename}' ({analysis_id[:10]})")
-                    # Error likely printed by retrieve_scan_results or handle_rate_limit
+                    logging.error(f"Result:       ERROR (Polling Failed: {poll_result}) for '{file_basename}' (ID: {analysis_id_from_upload[:10]})")
                     final_output = f"ERROR during polling for {file_basename} ({poll_result})"
                     console_color = Fore.RED
-                    logging.info(f"--- Finished '{file_basename}' (Error) ---")
-                    return poll_result
+                    result_status_code = poll_result
+                    return result_status_code
                 elif isinstance(poll_result, dict):
                     analysis_stats = poll_result
-                    analysis_source = f"New Analysis ({analysis_id[:10]})"
-                else:
+                    analysis_source = f"New/Re-Analysis ({analysis_id_from_upload[:10]})"
+                else: # Should be a dict or error string
                      logging.error(f"Result:       ERROR (Unexpected polling result type: {type(poll_result)}) for '{file_basename}'")
                      final_output = f"ERROR internal polling error for {file_basename}"
                      console_color = Fore.RED
-                     logging.info(f"--- Finished '{file_basename}' (Error) ---")
-                     return "error_internal_poll"
+                     result_status_code = "error_internal_poll"
+                     return result_status_code
+            # Removed the 'else' for 'isinstance(upload_response, str)' that was erroring on analysis ID.
+            # Now analysis_id_from_upload is correctly handled.
 
-        elif isinstance(vt_result, str) and vt_result.startswith("error"):
-            # Error already printed by check_file_hash or handle_rate_limit
+        elif isinstance(vt_result, str) and vt_result.startswith("error"): # Error from check_file_hash
             logging.error(f"Result:       ERROR (VT API Hash Check Failed: {vt_result}) for '{file_basename}'")
             final_output = f"ERROR during hash check for {file_basename} ({vt_result})"
             console_color = Fore.RED
-            logging.info(f"--- Finished '{file_basename}' (Error) ---")
-            return vt_result
-        else: # Should not happen
+            result_status_code = vt_result
+            return result_status_code
+        else: # Should not happen (check_file_hash returns dict, None, or error string)
              logging.error(f"Result:       ERROR (Unexpected hash check result type: {type(vt_result)}) for '{file_basename}'")
              final_output = f"ERROR internal hash check error for {file_basename}"
              console_color = Fore.RED
-             logging.info(f"--- Finished '{file_basename}' (Error) ---")
-             return "error_internal_hash"
+             result_status_code = "error_internal_hash"
+             return result_status_code
 
         # 5. Process Analysis Results
-        if analysis_stats is None and not final_output: # Only if no prior error/skip occurred
-             logging.warning(f"VT report found for '{file_basename}' but contained no 'last_analysis_stats'. Treating as inconclusive.")
+        if analysis_stats is None and not final_output: # Check if we got stats and no prior error
+             # This can happen if an existing report was found but had no last_analysis_stats
+             logging.warning(f"VT report for '{file_basename}' from '{analysis_source}' contained no 'last_analysis_stats'. Treating as inconclusive.")
              analysis_source += " - No Stats"
              final_output = f"Result: NO STATS in VT report - {file_basename}"
-             console_color = Fore.YELLOW
-             logging.info(f"Result:       ERROR (No Analysis Stats Found) '{file_basename}'")
-             logging.info(f"--- Finished '{file_basename}' (Error) ---")
-             return "error_no_stats"
-        elif analysis_stats is not None: # Only process if we got stats
+             console_color = Fore.CYAN # Changed from Yellow for 'NO STATS' to distinguish from 'SUSPICIOUS'
+             logging.info(f"Result:       INCONCLUSIVE (No Analysis Stats Found) '{file_basename}'")
+             result_status_code = "inconclusive_no_stats" # More specific status
+             # Cache this specific inconclusive state if desired
+             local_cache_update = {file_hash: "inconclusive:no_stats"}
+             save_cached_hashes(local_cache_update)
+             with cache_lock: cached_hashes_global[file_hash] = "inconclusive:no_stats"
+             return result_status_code
+
+        elif analysis_stats is not None: # We have stats to process
             logging.info(f"Processing analysis results from {analysis_source} for '{file_basename}'...")
             malicious = analysis_stats.get("malicious", 0)
             suspicious = analysis_stats.get("suspicious", 0)
             undetected = analysis_stats.get("undetected", 0)
             timeout = analysis_stats.get("timeout", 0)
             harmless = analysis_stats.get("harmless", 0)
-            confirmed_timeout = analysis_stats.get("confirmed-timeout", 0)
+            confirmed_timeout = analysis_stats.get("confirmed-timeout", 0) # Usually 0 for files
 
-            total_numeric = sum(v for v in [malicious, suspicious, undetected, timeout, harmless, confirmed_timeout] if isinstance(v, (int, float)))
-            result_details = f"M:{malicious}/S:{suspicious}/U:{undetected}/T:{timeout+confirmed_timeout}/H:{harmless} (Total:{total_numeric})"
+            total_numeric_engines = sum(v for v in [malicious, suspicious, undetected, timeout, harmless, confirmed_timeout] if isinstance(v, (int, float)))
+            result_details = f"M:{malicious}/S:{suspicious}/U:{undetected}/T:{timeout+confirmed_timeout}/H:{harmless} (Total Engines:{total_numeric_engines})"
             logging.info(f"Scan Stats:   {result_details} ('{file_basename}')")
 
             final_verdict = "UNKNOWN"
-            cache_key = "error:unknown_verdict"
-            result_status = "error_processing" # Local variable for return status
+            cache_key_to_save = "error:unknown_verdict"
+            # result_status_code is already initialized or set by prior paths
 
             if malicious > 0:
                 final_verdict = "MALICIOUS"; console_color = Fore.RED
-                cache_key = f"malicious:{malicious}/{total_numeric}"; result_status = "malicious"
+                cache_key_to_save = f"malicious:{malicious}/{total_numeric_engines}"
+                result_status_code = "malicious"
             elif suspicious > 0:
                  final_verdict = "SUSPICIOUS"; console_color = Fore.YELLOW
-                 cache_key = f"suspicious:{suspicious}/{total_numeric}"; result_status = "suspicious"
-            elif total_numeric > 0:
+                 cache_key_to_save = f"suspicious:{suspicious}/{total_numeric_engines}"
+                 result_status_code = "suspicious"
+            elif total_numeric_engines > 0: # Has results, none malicious or suspicious
                 final_verdict = "CLEAN"; console_color = Fore.GREEN
-                cache_key = "clean"; result_status = "clean"
-            else:
-                final_verdict = "INCONCLUSIVE"; console_color = Fore.CYAN
-                logging.warning(f"No conclusive verdict from stats for '{file_basename}': {analysis_stats}. Total engines reporting: {total_numeric}")
-                cache_key = "inconclusive"; result_status = "inconclusive"
+                cache_key_to_save = "clean"
+                result_status_code = "clean"
+            else: # No engines reported (malicious, suspicious, or undetected/harmless)
+                final_verdict = "INCONCLUSIVE (No Detections)"; console_color = Fore.CYAN
+                logging.warning(f"No conclusive verdict from stats for '{file_basename}': {analysis_stats}. Total engines reporting numeric: {total_numeric_engines}")
+                cache_key_to_save = "inconclusive:no_detections"
+                result_status_code = "inconclusive"
+
 
             logging.info(f"Result:       {final_verdict} ({result_details}) '{file_basename}'")
-            final_output = f"Result: {final_verdict} ({malicious}/{total_numeric}) - {file_basename}"
+            final_output = f"Result: {final_verdict} ({malicious}/{total_numeric_engines} Detections) - {file_basename}"
 
-            local_cache_update = {file_hash: cache_key}
-            save_cached_hashes(local_cache_update)
-            with cache_lock:
-                 cached_hashes_global[file_hash] = cache_key
-
-            logging.info(f"--- Finished '{file_basename}' ---")
-            return result_status # Return determined status code
-
-        # If we somehow reach here without analysis_stats and without a prior error/skip
-        # This indicates an internal logic error.
-        if not final_output:
-             logging.error(f"Internal logic error: Reached end of API processing for '{file_basename}' without analysis_stats or error.")
+            # Update cache
+            local_cache_update = {file_hash: cache_key_to_save}
+            save_cached_hashes(local_cache_update) # Saves to file, thread-safe
+            with cache_lock: # Update in-memory global cache
+                 cached_hashes_global[file_hash] = cache_key_to_save
+            return result_status_code
+        
+        # If final_output is set but we fall through, it means an error occurred before stats processing.
+        # This case should ideally be caught by earlier returns.
+        if not final_output : # Should not be reached if logic is correct, implies an unhandled path
+             logging.error(f"Internal logic error: Reached end of API processing for '{file_basename}' without a definitive outcome or error.")
              final_output = f"ERROR Internal processing error - {file_basename}"
              console_color = Fore.RED
-             logging.info(f"--- Finished '{file_basename}' (Error) ---")
-             return "error_internal_logic"
+             result_status_code = "error_internal_logic"
+             return result_status_code
 
-    # Ensure something is printed even if unexpected exception occurs
+
     except Exception as e:
         logging.error(f"Unhandled exception in process_file for '{file_basename}': {e.__class__.__name__}: {e}", exc_info=True)
         final_output = f"CRITICAL ERROR processing {file_basename}: {e.__class__.__name__}"
         console_color = Fore.RED + Style.BRIGHT
-        # Try to return a generic error status
-        return "error_unhandled_exception"
+        result_status_code = "error_unhandled_exception"
+        # This return will be caught by the finally block's print
+        return result_status_code
 
     finally:
-        # Print the final consolidated output for this file
-        if final_output:
+        # This ensures final output for the file is always printed
+        # and logging indicates completion or error state for this file.
+        if final_output: # Only print if there's something to show
              with print_lock:
-                 # Add indentation to visually group results/errors under the file being processed
                  print(console_color + "   " + final_output + Style.RESET_ALL)
+        
+        if result_status_code.startswith("error"):
+            logging.info(f"--- Finished '{file_basename}' (Status: {result_status_code}) ---")
+        else:
+            logging.info(f"--- Finished '{file_basename}' ---")
+        # The function should have returned a result_status_code by now.
+        # If it reaches here without a proper return, it's a logic flaw.
+        # However, all paths should lead to a return statement with a status code.
 
 
 # --- User Input Function ---
@@ -709,7 +754,6 @@ def process_file(file_path_tuple):
 def get_scan_folders_from_user():
     """Prompts the user to enter folder paths, remembering the last entry."""
     previous_folders = load_scan_history()
-    # Get user's home directory reliably
     home_dir = os.path.expanduser("~")
     default_base_path_display = f"{home_dir}{os.sep}"
 
@@ -721,18 +765,17 @@ def get_scan_folders_from_user():
         print(Fore.GREEN + "Previously scanned folders:")
         for i, folder in enumerate(previous_folders):
             print(f"  {i+1}: {folder}")
-        prompt_message += f"\n>>> Press {Style.BRIGHT}Enter{Style.NORMAL} to use these {len(previous_folders)} folder(s) again, or enter new paths (relative or absolute): "
+        prompt_message += f"\n>>> Press {Style.BRIGHT}Enter{Style.NORMAL} to use these {len(previous_folders)} folder(s) again, or enter new paths: "
     else:
         prompt_message += f">>> Enter paths relative to {Fore.MAGENTA}{os.path.basename(home_dir)}{Style.RESET_ALL}{Fore.CYAN}{os.sep}{Style.RESET_ALL}, or full paths: "
 
 
     while True:
         user_input = input(prompt_message).strip()
-
         selected_folders = []
+
         if not user_input and previous_folders:
             print(Fore.GREEN + "Using previous folder list.")
-            # Re-validate previous paths
             valid_folders = []
             invalid_found = False
             for folder in previous_folders:
@@ -744,25 +787,28 @@ def get_scan_folders_from_user():
                      invalid_found = True
             if invalid_found:
                  print(Fore.YELLOW + "Previous list contains invalid paths. Please enter paths manually.")
-                 previous_folders = []
-                 prompt_message = f">>> Enter paths relative to {Fore.MAGENTA}{os.path.basename(home_dir)}{Style.RESET_ALL}{Fore.CYAN}{os.sep}{Style.RESET_ALL}, or full paths: "
+                 previous_folders = [] # Clear invalid history to force new input
+                 # Update prompt to reflect no history available now
+                 prompt_message = Fore.CYAN + "\nEnter folder paths to scan, separated by commas (,).\n"
+                 prompt_message += Fore.YELLOW + f"(Maximum {ScannerConfig.MAX_SCAN_FOLDERS_INPUT} folders allowed)\n"
+                 prompt_message += Fore.CYAN + f"Paths starting without a drive letter (e.g., AppData\\...) will be relative to: {Fore.MAGENTA}{default_base_path_display}\n" + Style.RESET_ALL
+                 prompt_message += f">>> Enter paths relative to {Fore.MAGENTA}{os.path.basename(home_dir)}{Style.RESET_ALL}{Fore.CYAN}{os.sep}{Style.RESET_ALL}, or full paths: "
                  continue
             selected_folders = valid_folders
-            if not selected_folders:
+            if not selected_folders: # All previous paths were invalid
                  print(Fore.RED + "Error: Previous list had no valid paths remaining.")
+                 # previous_folders already cleared if invalid_found was true
                  continue
-            break
+            break # Successfully used (some) previous folders
         elif user_input:
             potential_folders_raw = [p.strip().strip('"') for p in user_input.split(',') if p.strip()]
             potential_folders_processed = []
 
-            # Process relative paths
             for p in potential_folders_raw:
                 if os.path.isabs(p):
                     potential_folders_processed.append(p)
                 else:
                     potential_folders_processed.append(os.path.join(home_dir, p))
-
 
             valid_folders = []
             invalid_found = False
@@ -793,18 +839,18 @@ def get_scan_folders_from_user():
                 continue
             else:
                 selected_folders = valid_folders
-                save_scan_history(selected_folders)
+                save_scan_history(selected_folders) # Save new valid list
                 print(Fore.GREEN + f"Selected {len(selected_folders)} folder(s) for scanning:")
                 for vf in selected_folders: print(f"  - {vf}")
                 break
-        else:
+        else: # No input and no previous folders
             print(Fore.RED + "Error: No folders provided. Please enter at least one folder path.")
+            # No 'continue' here, will loop back to input prompt naturally. If previous_folders was empty.
 
     return selected_folders
 
 
 # --- Main Execution ---
-# Unchanged from previous version
 
 def log_config(scan_folders_to_log):
     """Logs the current configuration settings to the log file."""
@@ -814,7 +860,7 @@ def log_config(scan_folders_to_log):
     logging.info(f"Scan Folders:     {scan_folders_to_log}")
     logging.info(f"File Extensions:  {ScannerConfig.FILE_EXTENSIONS}")
     logging.info(f"Max File Size:    {ScannerConfig.MAX_FILE_SIZE / (1024*1024):.0f} MB")
-    logging.info(f"Concurrency:      {ScannerConfig.MAX_CONCURRENT_SCANS} workers")
+    logging.info(f"Concurrency:      {ScannerConfig.MAX_CONCURRENT_SCANS} workers (ThreadPoolExecutor)")
     logging.info(f"Folder Limit:     {ScannerConfig.MAX_SCAN_FOLDERS_INPUT} input folders")
     logging.info(f"Log File:         {log_file}")
     logging.info(f"Cache File:       {ScannerConfig.HASH_CACHE_FILE}")
@@ -831,11 +877,11 @@ def run_scan():
         print(Fore.RED + "No valid folders selected for scanning. Exiting.")
         return
 
-    log_config(scan_folders)
+    log_config(scan_folders) # Log effective config
 
     print(Fore.CYAN + "\n--- VirusTotal Scanner Initializing ---")
     print(f"Logging detailed output to: {log_file}")
-    print(f"Scanning up to {ScannerConfig.MAX_CONCURRENT_SCANS} files concurrently.")
+    print(f"Scanning up to {ScannerConfig.MAX_CONCURRENT_SCANS} files concurrently using threads.")
     print(f"Matching extensions: {ScannerConfig.FILE_EXTENSIONS}\n")
 
     all_files_to_scan = []
@@ -847,32 +893,31 @@ def run_scan():
         found_in_folder = 0
         try:
             for root, dirs, files in os.walk(folder_path, topdown=True):
-                 # Optional pruning
-                 # dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', 'node_modules'}]
+                 # --- Activated Directory Pruning ---
+                 dirs[:] = [d for d in dirs if d.lower() not in {'.git', '.svn', '.hg', '__pycache__', 'node_modules', '$recycle.bin', 'system volume information', '.vscode', '.idea', 'target', 'build', 'dist'}]
+                 # Added more common ones and made check case-insensitive
 
-                 for f in files:
-                    if any(f.lower().endswith(ext) for ext in ScannerConfig.FILE_EXTENSIONS):
+                 for f_name in files: # Renamed to f_name to avoid conflict with open file 'f'
+                    if any(f_name.lower().endswith(ext.lower()) for ext in ScannerConfig.FILE_EXTENSIONS):
                         try:
-                             full_path = os.path.join(root, f)
-                             if os.path.isfile(full_path): # Check if it's actually a file
+                             full_path = os.path.join(root, f_name)
+                             if os.path.isfile(full_path):
                                  try:
-                                     # Quick size check to filter out empties here
                                      if os.path.getsize(full_path) > 0:
                                          all_files_to_scan.append(full_path)
                                          found_in_folder += 1
                                      else:
                                           logging.debug(f"Skipping empty file during discovery: {full_path}")
-                                 except OSError:
-                                     logging.warning(f"Could not get size for file during discovery (permissions?): {full_path}")
-                             else:
-                                 logging.debug(f"Path found is not a file: {full_path}") # Link? Directory?
-
-                        except Exception as e: # Catch potential errors joining path etc.
-                             logging.warning(f"Error processing potential file during discovery in {root}: {f} - {e}")
+                                 except OSError as e_size:
+                                     logging.warning(f"Could not get size for file during discovery (permissions?): {full_path} - {e_size}")
+                             # else: # Not a file (symlink to dir, broken symlink etc.)
+                             #    logging.debug(f"Path found is not a regular file: {full_path}")
+                        except Exception as e_path:
+                             logging.warning(f"Error processing potential file '{f_name}' in '{root}': {e_path}")
             print(f"   ...found {found_in_folder} potentially scannable files.")
             logging.info(f"Found {found_in_folder} potentially scannable files in {folder_path}")
-        except Exception as e:
-            error_msg = f"Error walking directory {folder_path}: {e.__class__.__name__}: {e}"
+        except Exception as e_walk:
+            error_msg = f"Error walking directory {folder_path}: {e_walk.__class__.__name__}: {e_walk}"
             print(Fore.RED + error_msg)
             logging.error(error_msg, exc_info=True)
 
@@ -886,33 +931,26 @@ def run_scan():
 
     print(Fore.CYAN + f"\n--- Scan Starting: Processing {total_files} files ---")
 
-    # --- Summary Counters ---
     results_summary = {
         "total_found": total_files,
-        "processed_api": 0,
-        "processed_cache": 0,
-        "results": { # Nested dict for results
-            "clean": 0,
-            "malicious": 0,
-            "suspicious": 0,
-            "inconclusive": 0,
+        "processed_api": 0, # Files that resulted in an API call for primary verdict (hash check, upload+poll)
+        "processed_cache": 0, # Files whose primary verdict came from cache
+        "results": {
+            "clean": 0, "malicious": 0, "suspicious": 0, "inconclusive": 0,
+            "inconclusive_no_stats": 0, # Added for clarity
         },
         "skipped_total": 0,
-        "skipped_details": { # Track specific skip reasons
-            "size": 0,
-            "empty": 0,
-            "conflict": 0,
-            # Add other specific skip reasons if introduced
+        "skipped_details": {
+            "size": 0, "empty": 0, #"conflict": 0, # Conflict now leads to re-analysis usually
         },
-        "errors": 0,
+        "errors": 0, # Count of files that resulted in an error status
     }
 
     tasks = [(file_path, i + 1, total_files) for i, file_path in enumerate(all_files_to_scan)]
 
-    print(f"Starting parallel processing with up to {ScannerConfig.MAX_CONCURRENT_SCANS} workers...")
-    all_results_statuses = []
+    # print(f"Starting parallel processing with up to {ScannerConfig.MAX_CONCURRENT_SCANS} workers...") # Already printed
+    # all_results_statuses = [] # Not strictly needed if only counting
 
-    # --- Execute processing in parallel ---
     with concurrent.futures.ThreadPoolExecutor(max_workers=ScannerConfig.MAX_CONCURRENT_SCANS, thread_name_prefix='VTScanWorker') as executor:
         future_to_path = {executor.submit(process_file, task): task[0] for task in tasks}
         processed_count = 0
@@ -921,113 +959,106 @@ def run_scan():
             file_basename_processed = os.path.basename(file_path_processed)
             processed_count += 1
             try:
-                result_status = future.result()
-                all_results_statuses.append(result_status)
+                result_status = future.result() # This is the status code string from process_file
 
-                # Update summary counters
+                # Update summary counters based on the result_status string
                 if result_status == "clean":
                     results_summary["processed_api"] += 1; results_summary["results"]["clean"] += 1
                 elif result_status == "malicious":
                     results_summary["processed_api"] += 1; results_summary["results"]["malicious"] += 1
                 elif result_status == "suspicious":
                     results_summary["processed_api"] += 1; results_summary["results"]["suspicious"] += 1
-                elif result_status == "inconclusive":
+                elif result_status == "inconclusive" or result_status == "inconclusive:no_detections": # From stats processing
                     results_summary["processed_api"] += 1; results_summary["results"]["inconclusive"] += 1
+                elif result_status == "inconclusive_no_stats": # From existing report with no stats
+                    results_summary["processed_api"] += 1; results_summary["results"]["inconclusive_no_stats"] += 1
+
                 elif result_status == "skipped_cache_clean":
                     results_summary["processed_cache"] += 1; results_summary["results"]["clean"] += 1
                 elif result_status == "skipped_cache_malicious":
                     results_summary["processed_cache"] += 1; results_summary["results"]["malicious"] += 1
                 elif result_status == "skipped_cache_suspicious":
                     results_summary["processed_cache"] += 1; results_summary["results"]["suspicious"] += 1
+                # Other "skipped_cache_..." could be added if defined, e.g. inconclusive from cache
+
                 elif result_status == "skipped_size":
                     results_summary["skipped_total"] += 1; results_summary["skipped_details"]["size"] += 1
                 elif result_status == "skipped_empty":
                     results_summary["skipped_total"] += 1; results_summary["skipped_details"]["empty"] += 1
-                elif result_status == "skipped_conflict":
-                    results_summary["skipped_total"] += 1; results_summary["skipped_details"]["conflict"] += 1
+                # elif result_status == "skipped_conflict": # Conflict on upload now means re-analysis, so not a skip
+                # results_summary["skipped_total"] += 1; results_summary["skipped_details"]["conflict"] += 1
+
                 elif isinstance(result_status, str) and result_status.startswith("error"):
                     results_summary["errors"] += 1
-                else: # Catch unexpected statuses from process_file
-                    logging.error(f"Unhandled status '{result_status}' returned for '{file_basename_processed}'")
+                elif result_status is None: # Should not happen if process_file always returns a string
+                    logging.error(f"CRITICAL: process_file for '{file_basename_processed}' returned None.")
+                    results_summary["errors"] +=1
+                else: # Catch-all for any unexpected statuses from process_file
+                    logging.error(f"Unhandled status '{result_status}' returned for '{file_basename_processed}' during summary.")
                     results_summary["errors"] += 1
-                    # Print error directly as it's unexpected behavior
-                    with print_lock: print(Fore.RED + f"   Internal Error: Unhandled status '{result_status}' for {file_basename_processed}")
+                    with print_lock: print(Fore.RED + f"   Internal Error: Unhandled status '{result_status}' for {file_basename_processed} in summary.")
 
-                # Print API usage summary periodically
-                if processed_count % 25 == 0 and processed_count != total_files: # Adjusted frequency
+                if processed_count % 25 == 0 and processed_count != total_files:
                     print_usage_summary(prefix="\n   --- API Usage Update --- \n   ", to_log=True)
 
-
-            except Exception as exc:
-                logging.error(f"CRITICAL error processing future for '{file_basename_processed}': {exc.__class__.__name__}: {exc}", exc_info=True)
+            except Exception as exc_future:
+                logging.error(f"CRITICAL error processing future for '{file_basename_processed}': {exc_future.__class__.__name__}: {exc_future}", exc_info=True)
                 results_summary["errors"] += 1
-                with print_lock: print(Fore.RED + Style.BRIGHT + f"   CRITICAL WORKER ERROR processing {file_basename_processed}: {exc.__class__.__name__}")
-                all_results_statuses.append("error_future")
+                with print_lock: print(Fore.RED + Style.BRIGHT + f"   CRITICAL WORKER ERROR processing {file_basename_processed}: {exc_future.__class__.__name__}")
+                # all_results_statuses.append("error_future") # If collecting all statuses
 
     # --- Final Summary ---
-    final_counters = load_counters()
+    final_counters = load_counters() # Reload for final, most up-to-date numbers
     final_usage_str = f"API Usage -> Today: {final_counters['daily']['count']} | Month: {final_counters['monthly']['count']} | Total: {final_counters['all_time']}"
 
-    # Build result breakdown string
-    results_breakdown = ", ".join(f"{k.capitalize()}: {v}" for k, v in results_summary["results"].items() if v > 0)
-    if not results_breakdown: results_breakdown = "None"
-
-    # Build skipped breakdown string
-    skipped_breakdown_parts = []
-    for reason, count in results_summary["skipped_details"].items():
-        if count > 0:
-            skipped_breakdown_parts.append(f"{reason.capitalize()}: {count}")
-    skipped_breakdown = ", ".join(skipped_breakdown_parts) if skipped_breakdown_parts else "None"
-
-
-    summary_log_lines = [
-        "\n" + "="*70,
-        "Scan Complete Summary",
-        "="*70,
-           f"  Total Files Found:    {results_summary['total_found']} ({results_breakdown})",
-        f"  Processed via API:       {results_summary['processed_api']}",
-        f"  Processed via Cache:     {results_summary['processed_cache']}",
-        f"  Skipped Total:           {results_summary['skipped_total']} ({skipped_breakdown})",
-        f"  Errors Encountered:      {results_summary['errors']}",
-        "-"*70,
-        f"  Final {final_usage_str}",
-        "="*70
-    ]
+    results_combined = results_summary["results"]
+    results_breakdown_str = (
+        f"{Fore.GREEN}Clean: {results_combined['clean']}{Style.RESET_ALL}, "
+        f"{Fore.RED}Malicious: {results_combined['malicious']}{Style.RESET_ALL}, "
+        f"{Fore.YELLOW}Suspicious: {results_combined['suspicious']}{Style.RESET_ALL}, "
+        f"{Fore.CYAN}Inconclusive: {results_combined['inconclusive'] + results_combined['inconclusive_no_stats']}{Style.RESET_ALL}"
+    )
+    
+    skipped_details = results_summary["skipped_details"]
+    skipped_breakdown_str = (
+        f"({Fore.YELLOW}Size: {skipped_details['size']}{Style.RESET_ALL}, "
+        f"{Fore.YELLOW}Empty: {skipped_details['empty']}{Style.RESET_ALL})"
+        # Add other skipped reasons here if they are tracked
+    )
 
     # Print summary to console with color
     print("\n" + "="*70)
     print(Fore.MAGENTA + Style.BRIGHT + "📊 Scan Complete Summary" + Style.RESET_ALL)
     print("="*70)
-    # Combine Total Found with results breakdown
-    print  (f"  Total Files Found: {results_summary['total_found']} " +
-          f"({Fore.GREEN}Clean: {results_summary['results']['clean']}{Style.RESET_ALL}, " +
-          f"{Fore.RED}Malicious: {results_summary['results']['malicious']}{Style.RESET_ALL}, " +
-          f"{Fore.YELLOW}Suspicious: {results_summary['results']['suspicious']}{Style.RESET_ALL}, " +
-          f"{Fore.CYAN}Inconclusive: {results_summary['results']['inconclusive']}{Style.RESET_ALL})")
+    print(f"  Total Files Found:       {results_summary['total_found']}")
+    print(f"  Results Breakdown:       {results_breakdown_str}")
     print(f"  Processed via API:       {results_summary['processed_api']}")
     print(f"  Processed via Cache:     {results_summary['processed_cache']}")
-    # Show detailed skipped counts
-    print(f"  Skipped Total:           {results_summary['skipped_total']} " +
-          f"({Fore.YELLOW}Size: {results_summary['skipped_details']['size']}{Style.RESET_ALL}, " +
-          f"{Fore.YELLOW}Empty: {results_summary['skipped_details']['empty']}{Style.RESET_ALL}, " +
-          f"{Fore.YELLOW}Conflict: {results_summary['skipped_details']['conflict']}{Style.RESET_ALL})") # Add more if needed
+    print(f"  Skipped Total:           {results_summary['skipped_total']} {skipped_breakdown_str if results_summary['skipped_total'] > 0 else ''}")
     print(Fore.RED + Style.BRIGHT + f"  Errors Encountered:      {results_summary['errors']}")
     print("-"*70)
     print(Fore.MAGENTA + f"  Final {final_usage_str}")
     print("="*70)
     print(f"\nDetailed logs available in: {log_file}")
 
+
 if __name__ == "__main__":
     try:
         run_scan()
     except Exception as e:
         critical_error_msg = f"🆘 CRITICAL UNHANDLED ERROR in main execution: {e.__class__.__name__}: {e}"
-        with print_lock:
-             print(Fore.RED + Style.BRIGHT + "\n" + critical_error_msg)
+        # Ensure print_lock is available or handle if it's not (e.g. very early error)
+        if 'print_lock' in globals():
+            with print_lock:
+                 print(Fore.RED + Style.BRIGHT + "\n" + critical_error_msg)
+        else:
+            print(Fore.RED + Style.BRIGHT + "\n" + critical_error_msg) # Fallback print
         logging.critical(critical_error_msg, exc_info=True)
     finally:
         final_msg = "--- Scanner Finished ---"
-        with print_lock:
-             print("\n" + Fore.CYAN + final_msg)
-        # Keep window open until user presses Enter
+        if 'print_lock' in globals():
+            with print_lock:
+                 print("\n" + Fore.CYAN + final_msg)
+        else:
+            print("\n" + Fore.CYAN + final_msg) # Fallback print
         input("\n>>> Press Enter to close the window...")
