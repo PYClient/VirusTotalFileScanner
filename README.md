@@ -1,6 +1,6 @@
 # VirusTotal File Scanner
 
-A quick and carefully optimized Python script that scans files in a choses file directory using your VirusTotal API key. It prints scan results to the terminal and logs all results to a log file
+A quick and carefully optimized Python script that scans files in a chosen file directory using your VirusTotal API key. It prints scan results to the terminal and logs all results to a log file
 
 ---
 
@@ -38,7 +38,7 @@ You can run it from a terminal:
 python VirusTotalScanner.py
 ```
 
-You can also run it from your file explorer if Python associated with `.py` files
+You can also run it from your file explorer if Python is associated with `.py` files
 
 ---
 
@@ -59,7 +59,7 @@ You can also run it from your file explorer if Python associated with `.py` file
 - **File types to scan**: Change the `FILE_EXTENSIONS` list (default: `.exe`, change to whatever file type your trying to scan)
 - **Scan speed and retry behavior**: Configurable in `ScannerConfig`
 - **32MB file limit**: This limit can be removed by Premium VT users
-- **Thread count**: Do not change unless you know what your doing
+- **Thread count**: Only change this if you understand the impact on rate limits and threading behavior
 
 ---
 
@@ -74,4 +74,4 @@ Scan result logs are saved to the file directory you specified. Every file has t
 - Large files (over 32MB) are ignored unless you have a premium API (requires VirusTotal premium subscription)
 - Caches prior scans to avoid any unnecessary API requests/usages, and quicker scanning
 - Simple-to-read and organized color-coded output makes it easy to locate problems or scan results
-- Multiprocessing for CPU accelerated scanning speed
+- Thread-based concurrency for faster scanning (5 files in parallel by default)
